@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package pubsub;
+
+option go_package = "github.com/rajveermalviya/pubsub-broker/pb";
+
+service PubSubBroker {
+  rpc Publish(PublishReq) returns (Empty);
+  rpc Subscribe(SubscribeReq) returns (stream Message);
+}
+
+message Message {
+  map<string, string> metadata = 1;
+  bytes data = 2;
+}
+
+message PublishReq {
+  string topic = 1;
+  Message message = 2;
+}
+
+message SubscribeReq { string topic = 1; }
+
+message Empty {}
