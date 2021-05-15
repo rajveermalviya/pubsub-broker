@@ -13,6 +13,7 @@ import (
 	"github.com/rajveermalviya/pubsub-broker/pb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 )
 
@@ -38,6 +39,7 @@ type cleanupRequest struct {
 }
 
 type broker struct {
+	grpc_health_v1.UnimplementedHealthServer
 	pb.UnimplementedPubSubBrokerServer
 
 	topics map[string]*topic
@@ -52,7 +54,7 @@ type broker struct {
 
 var idCounter uint64
 
-func (b broker) run() {
+func (b *broker) run() {
 	defer func() {
 		log.Println("broker manager stopped")
 		b.wg.Done()
@@ -75,7 +77,7 @@ func (b broker) run() {
 	}
 }
 
-func (b broker) publish(req *pb.PublishReq) {
+func (b *broker) publish(req *pb.PublishReq) {
 	t, ok := b.topics[req.Topic]
 	if !ok {
 		// If topic is not found that means no one is subscribed
@@ -106,7 +108,7 @@ func (b broker) publish(req *pb.PublishReq) {
 	log.Println("sent")
 }
 
-func (b broker) subscribe(rID uint64, req *pb.SubscribeReq, srv pb.PubSubBroker_SubscribeServer) {
+func (b *broker) subscribe(rID uint64, req *pb.SubscribeReq, srv pb.PubSubBroker_SubscribeServer) {
 	t, ok := b.topics[req.Topic]
 	if !ok {
 		t = &topic{
@@ -125,7 +127,7 @@ func (b broker) subscribe(rID uint64, req *pb.SubscribeReq, srv pb.PubSubBroker_
 	log.Println("connected", rID)
 }
 
-func (b broker) cleanupReceiver(topic string, rID uint64) {
+func (b *broker) cleanupReceiver(topic string, rID uint64) {
 	t, ok := b.topics[topic]
 	if !ok {
 		return
@@ -145,13 +147,13 @@ func (b broker) cleanupReceiver(topic string, rID uint64) {
 	log.Println("cleaned up", rID)
 }
 
-func (b broker) Publish(ctx context.Context, req *pb.PublishReq) (*pb.Empty, error) {
+func (b *broker) Publish(ctx context.Context, req *pb.PublishReq) (*pb.Empty, error) {
 	b.publishMessageChan <- req
 
 	return &pb.Empty{}, nil
 }
 
-func (b broker) Subscribe(req *pb.SubscribeReq, srv pb.PubSubBroker_SubscribeServer) error {
+func (b *broker) Subscribe(req *pb.SubscribeReq, srv pb.PubSubBroker_SubscribeServer) error {
 	rID := atomic.AddUint64(&idCounter, 1)
 
 	b.subscribeReceiverChan <- subscribeRequest{
@@ -167,6 +169,10 @@ func (b broker) Subscribe(req *pb.SubscribeReq, srv pb.PubSubBroker_SubscribeSer
 		rID:   rID,
 	}
 	return nil
+}
+
+func (b *broker) Check(ctx context.Context, in *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
+	return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_SERVING}, nil
 }
 
 func main() {
@@ -192,6 +198,7 @@ func main() {
 	}
 
 	pb.RegisterPubSubBrokerServer(s, b)
+	grpc_health_v1.RegisterHealthServer(s, b)
 
 	// Run broker manager
 	log.Println("starting broker manager")
