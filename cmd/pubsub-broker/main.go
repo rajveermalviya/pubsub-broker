@@ -23,14 +23,14 @@ type topic struct {
 }
 
 type receiver struct {
-	id  uint64
-	srv pb.PubSubBroker_SubscribeServer
+	id           uint64
+	clientStream pb.PubSubBroker_SubscribeServer
 }
 
 type subscribeRequest struct {
-	rID uint64
-	req *pb.SubscribeReq
-	srv pb.PubSubBroker_SubscribeServer
+	rID          uint64
+	req          *pb.SubscribeReq
+	clientStream pb.PubSubBroker_SubscribeServer
 }
 
 type cleanupRequest struct {
@@ -66,7 +66,7 @@ func (b *broker) run() {
 			b.publish(r)
 
 		case r := <-b.subscribeReceiverChan:
-			b.subscribe(r.rID, r.req, r.srv)
+			b.subscribe(r.rID, r.req, r.clientStream)
 
 		case r := <-b.cleanupReceiverChan:
 			b.cleanupReceiver(r.topic, r.rID)
@@ -95,7 +95,7 @@ func (b *broker) publish(req *pb.PublishReq) {
 
 	// Send message to all connected receivers
 	for _, r := range t.receivers {
-		if err := r.srv.Send(req.Message); err != nil {
+		if err := r.clientStream.Send(req.Message); err != nil {
 			switch status.Code(err) {
 			case codes.Canceled, codes.Unavailable:
 				// Do nothing
@@ -108,7 +108,7 @@ func (b *broker) publish(req *pb.PublishReq) {
 	log.Println("sent")
 }
 
-func (b *broker) subscribe(rID uint64, req *pb.SubscribeReq, srv pb.PubSubBroker_SubscribeServer) {
+func (b *broker) subscribe(rID uint64, req *pb.SubscribeReq, stream pb.PubSubBroker_SubscribeServer) {
 	t, ok := b.topics[req.Topic]
 	if !ok {
 		t = &topic{
@@ -120,8 +120,8 @@ func (b *broker) subscribe(rID uint64, req *pb.SubscribeReq, srv pb.PubSubBroker
 	}
 
 	t.receivers[rID] = &receiver{
-		id:  rID,
-		srv: srv,
+		id:           rID,
+		clientStream: stream,
 	}
 
 	log.Println("connected", rID)
@@ -153,16 +153,16 @@ func (b *broker) Publish(ctx context.Context, req *pb.PublishReq) (*pb.Empty, er
 	return &pb.Empty{}, nil
 }
 
-func (b *broker) Subscribe(req *pb.SubscribeReq, srv pb.PubSubBroker_SubscribeServer) error {
+func (b *broker) Subscribe(req *pb.SubscribeReq, stream pb.PubSubBroker_SubscribeServer) error {
 	rID := atomic.AddUint64(&idCounter, 1)
 
 	b.subscribeReceiverChan <- subscribeRequest{
-		rID: rID,
-		req: req,
-		srv: srv,
+		rID:          rID,
+		req:          req,
+		clientStream: stream,
 	}
 
-	<-srv.Context().Done()
+	<-stream.Context().Done()
 
 	b.cleanupReceiverChan <- cleanupRequest{
 		topic: req.Topic,
