@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +19,7 @@ import (
 )
 
 type topic struct {
+	mu        *sync.RWMutex
 	topic     string
 	receivers map[uint64]*receiver
 }
@@ -27,74 +29,47 @@ type receiver struct {
 	clientStream pb.PubSubBroker_SubscribeServer
 }
 
-type subscribeRequest struct {
-	rID          uint64
-	req          *pb.SubscribeReq
-	clientStream pb.PubSubBroker_SubscribeServer
-}
-
-type cleanupRequest struct {
-	topic string
-	rID   uint64
-}
-
 type broker struct {
 	grpc_health_v1.UnimplementedHealthServer
 	pb.UnimplementedPubSubBrokerServer
 
+	mu     *sync.RWMutex
 	topics map[string]*topic
 
-	publishMessageChan    chan *pb.PublishReq
-	subscribeReceiverChan chan subscribeRequest
-	cleanupReceiverChan   chan cleanupRequest
-
-	exitChan chan struct{}
-	wg       *sync.WaitGroup
+	gcMutex      *sync.RWMutex
+	lastCallToGC time.Time
 }
 
 var idCounter uint64
 
-func (b *broker) run() {
-	defer func() {
-		log.Println("broker manager stopped")
-		b.wg.Done()
-	}()
-
-	for {
-		select {
-		case r := <-b.publishMessageChan:
-			b.publish(r)
-
-		case r := <-b.subscribeReceiverChan:
-			b.subscribe(r.rID, r.req, r.clientStream)
-
-		case r := <-b.cleanupReceiverChan:
-			b.cleanupReceiver(r.topic, r.rID)
-
-		case <-b.exitChan:
-			return
-		}
-	}
-}
-
-func (b *broker) publish(req *pb.PublishReq) {
+func (b *broker) Publish(ctx context.Context, req *pb.PublishReq) (*pb.Empty, error) {
+	b.mu.RLock()
 	t, ok := b.topics[req.Topic]
 	if !ok {
+		b.mu.RUnlock()
+
 		// If topic is not found that means no one is subscribed
 		// publish is noop
-		return
+		return &pb.Empty{}, nil
 	}
+	b.mu.RUnlock()
 
+	t.mu.RLock()
 	if len(t.receivers) == 0 {
+		t.mu.RUnlock()
 		// If topic is found but there are no receivers
 		// publish is noop
-		return
+		return &pb.Empty{}, nil
 	}
+	t.mu.RUnlock()
 
 	log.Println("sending")
 
 	// Send message to all connected receivers
+	t.mu.RLock()
 	for _, r := range t.receivers {
+		t.mu.RUnlock()
+
 		if err := r.clientStream.Send(req.Message); err != nil {
 			switch status.Code(err) {
 			case codes.Canceled, codes.Unavailable:
@@ -103,52 +78,12 @@ func (b *broker) publish(req *pb.PublishReq) {
 				log.Println("unable to send:", err)
 			}
 		}
+
+		t.mu.RLock()
 	}
+	t.mu.RUnlock()
 
 	log.Println("sent")
-}
-
-func (b *broker) subscribe(rID uint64, req *pb.SubscribeReq, stream pb.PubSubBroker_SubscribeServer) {
-	t, ok := b.topics[req.Topic]
-	if !ok {
-		t = &topic{
-			topic:     req.Topic,
-			receivers: map[uint64]*receiver{},
-		}
-
-		b.topics[t.topic] = t
-	}
-
-	t.receivers[rID] = &receiver{
-		id:           rID,
-		clientStream: stream,
-	}
-
-	log.Println("connected", rID)
-}
-
-func (b *broker) cleanupReceiver(topic string, rID uint64) {
-	t, ok := b.topics[topic]
-	if !ok {
-		return
-	}
-
-	// Remove receiver
-	t.receivers[rID] = nil
-	delete(t.receivers, rID)
-
-	// If receivers empty, then remove topic
-	if len(t.receivers) == 0 {
-		// Remove topic
-		b.topics[topic] = nil
-		delete(b.topics, topic)
-	}
-
-	log.Println("cleaned up", rID)
-}
-
-func (b *broker) Publish(ctx context.Context, req *pb.PublishReq) (*pb.Empty, error) {
-	b.publishMessageChan <- req
 
 	return &pb.Empty{}, nil
 }
@@ -156,18 +91,77 @@ func (b *broker) Publish(ctx context.Context, req *pb.PublishReq) (*pb.Empty, er
 func (b *broker) Subscribe(req *pb.SubscribeReq, stream pb.PubSubBroker_SubscribeServer) error {
 	rID := atomic.AddUint64(&idCounter, 1)
 
-	b.subscribeReceiverChan <- subscribeRequest{
-		rID:          rID,
-		req:          req,
-		clientStream: stream,
+	// Keep track of subscriber
+	{
+		r := &receiver{
+			id:           rID,
+			clientStream: stream,
+		}
+
+		b.mu.RLock()
+		t, ok := b.topics[req.Topic]
+		if !ok {
+			b.mu.RUnlock()
+
+			t = &topic{
+				mu:        &sync.RWMutex{},
+				topic:     req.Topic,
+				receivers: map[uint64]*receiver{rID: r},
+			}
+
+			b.mu.Lock()
+			b.topics[req.Topic] = t
+			b.mu.Unlock()
+		} else {
+			b.mu.RUnlock()
+
+			t.mu.Lock()
+			t.receivers[rID] = r
+			t.mu.Unlock()
+		}
+
+		log.Println("connected", rID)
 	}
 
+	// Wait till client disconnects
 	<-stream.Context().Done()
 
-	b.cleanupReceiverChan <- cleanupRequest{
-		topic: req.Topic,
-		rID:   rID,
+	// Cleanup
+	{
+		b.mu.RLock()
+		t, ok := b.topics[req.Topic]
+		if !ok {
+			b.mu.RUnlock()
+			return nil
+		}
+		b.mu.RUnlock()
+
+		// Remove receiver
+		t.mu.Lock()
+		t.receivers[rID] = nil
+		delete(t.receivers, rID)
+		t.mu.Unlock()
+
+		// Invoke GC manually
+		now := time.Now()
+
+		b.gcMutex.RLock()
+		if now.Sub(b.lastCallToGC).Seconds() > 60 {
+			b.gcMutex.RUnlock()
+
+			b.gcMutex.Lock()
+			b.lastCallToGC = now
+			b.gcMutex.Unlock()
+
+			log.Println("running GC")
+			runtime.GC()
+		} else {
+			b.gcMutex.RUnlock()
+		}
+
+		log.Println("cleaned up", rID)
 	}
+
 	return nil
 }
 
@@ -188,31 +182,24 @@ func main() {
 
 	s := grpc.NewServer()
 	b := &broker{
-		topics:                map[string]*topic{},
-		publishMessageChan:    make(chan *pb.PublishReq),
-		subscribeReceiverChan: make(chan subscribeRequest),
-		cleanupReceiverChan:   make(chan cleanupRequest),
-
-		exitChan: make(chan struct{}),
-		wg:       &sync.WaitGroup{},
+		mu:           &sync.RWMutex{},
+		topics:       map[string]*topic{},
+		gcMutex:      &sync.RWMutex{},
+		lastCallToGC: time.Now(),
 	}
 
 	pb.RegisterPubSubBrokerServer(s, b)
 	grpc_health_v1.RegisterHealthServer(s, b)
 
-	// Run broker manager
-	log.Println("starting broker manager")
-	b.wg.Add(1)
-	go b.run()
-
+	wg := &sync.WaitGroup{}
 	log.Println("starting listener on port:", port)
-	b.wg.Add(1)
+	wg.Add(1)
 	go func() {
 		if err := s.Serve(lis); err != nil {
 			log.Fatalf("failed to serve: %v", err)
 		}
 
-		b.wg.Done()
+		wg.Done()
 	}()
 
 	c := make(chan os.Signal, 1)
@@ -220,16 +207,12 @@ func main() {
 
 	log.Println("got signal:", <-c)
 
-	// Send exit signal to broker manager
-	log.Println("stopping broker manager")
-	close(b.exitChan)
-
 	serverStopped := make(chan struct{})
-	b.wg.Add(1)
+	wg.Add(1)
 	go func() {
 		s.GracefulStop()
 		close(serverStopped)
-		b.wg.Done()
+		wg.Done()
 	}()
 
 	timer := time.NewTimer(5 * time.Second)
@@ -242,5 +225,5 @@ func main() {
 		timer.Stop()
 	}
 
-	b.wg.Wait()
+	wg.Wait()
 }

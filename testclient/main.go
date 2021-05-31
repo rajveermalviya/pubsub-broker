@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync/atomic"
+	"time"
 
 	"github.com/rajveermalviya/pubsub-broker/pb"
 	"google.golang.org/grpc"
@@ -14,7 +16,7 @@ import (
 func main() {
 	ctx := context.Background()
 
-	conn, err := grpc.Dial("localhost:8080", grpc.WithInsecure())
+	conn, err := grpc.Dial(":8080", grpc.WithInsecure())
 	if err != nil {
 		log.Fatalln("unable to dial: ", err)
 	}
@@ -47,16 +49,35 @@ func main() {
 		}(i)
 	}
 
-	for {
+	go func() {
 		req := &pb.PublishReq{
 			Topic:   "topic1",
 			Message: &pb.Message{Data: []byte("Hello")},
 		}
-		if _, err := client.Publish(ctx, req); err != nil {
-			log.Println("Publish failed: ", err)
-			break
+		for {
+			if _, err := client.Publish(ctx, req); err != nil {
+				log.Println("Publish failed: ", err)
+				break
+			}
 		}
+	}()
 
-		log.Println(atomic.LoadUint64(&msgCount))
+	lastCountTimestamp := time.Now()
+	lastMsgCount := uint64(0)
+
+	for {
+		time.Sleep(5 * time.Second)
+
+		now := time.Now()
+		count := atomic.LoadUint64(&msgCount)
+		diff := count - lastMsgCount
+		timeDiff := now.Sub(lastCountTimestamp)
+
+		throughPut := float64(diff) / timeDiff.Seconds()
+
+		fmt.Printf("\rThrough put: %f msgs/sec     ", throughPut)
+
+		lastCountTimestamp = now
+		lastMsgCount = count
 	}
 }
